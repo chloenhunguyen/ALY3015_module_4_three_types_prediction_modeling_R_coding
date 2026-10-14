@@ -1,0 +1,279 @@
+---
+title: "Instagram Analytics: Three Prediction Models"
+---
+title: "Module 4 Assignment: Instagram Analytics"
+author: "Huynh Nhu Nguyen"
+date: "`Oct-10-2026`"
+output: word_document
+---
+
+# 1. Introduction
+
+This project studies 4,509 Instagram posts and builds three prediction models: a binary model for viral posts, a multi-category model for popularity, and a count model for the number of followers on an account. I use simple charts, a training/test split, and prediction metrics to explain how well each model works.
+
+**Important note about the count target:** The documentation specifically names `follower_count` for Part C, even though its written goal is to predict *new followers gained*. The dataset also has `followers_gained`, which would better answer that goal. I use `follower_count` to follow the explicit variable instruction. This model predicts the existing account size, **not** newly gained followers. To model new followers instead, change `count_target` to `"followers_gained"` in the setup section and rerun the report.
+
+**Prediction timing:** I use only information available at or before posting as predictors. Likes, comments, reach, impressions, engagement rate, shares, saves, and followers gained are outcomes observed after posting and are deliberately excluded to prevent data leakage. Account IDs and post IDs are also excluded because they are identifiers, not useful explanations. This makes the task more realistic, although some classification performance may be modest.
+
+# 2. Packages and data preparation
+
+```{r setup, message=FALSE, warning=FALSE}
+install.packages(
+  c("tidyverse", "nnet", "MASS", "knitr", "scales"),
+  repos = "https://cloud.r-project.org"
+)
+# Load packages 
+library(tidyverse)
+library(nnet)
+library(MASS)
+library(knitr)
+library(scales)
+
+# Make results reproducible
+set.seed(3015)
+
+# Response variable for count modeling
+count_target <- "follower_count"
+```
+
+```{r import-clean}
+# Read the CSV from the same folder as this Rmd file.
+dat_raw <- read.csv("Instagram_Analytics_small.csv", na.strings = c("", "NA", "NaN"))
+
+# Check dataset dimensions, missing values, and exact duplicates.
+data.frame(Observations = nrow(dat_raw), Columns = ncol(dat_raw),
+           Missing_cells = sum(is.na(dat_raw)),
+           Duplicate_rows = sum(duplicated(dat_raw))) |> kable()
+
+# Instructions say to remove rows containing missing values, not impute them.
+dat <- dat_raw |> distinct() |> drop_na()
+
+# Convert text groups to factors. Order class labels to make output consistent.
+dat <- dat |>
+  mutate(across(c(account_type, media_type, content_category,
+                  traffic_source, day_of_week), factor),
+         performance_bucket_label = factor(performance_bucket_label,
+               levels = c("low", "medium", "high", "viral")),
+         viral_binary = factor(ifelse(performance_bucket_label == "viral",
+                               "viral", "not_viral"),
+                               levels = c("not_viral", "viral")),
+         has_call_to_action = factor(has_call_to_action))
+
+# Dates are not used: day_of_week and post_hour already summarize timing.
+cat("Rows retained after cleaning:", nrow(dat), "\n")
+```
+
+# 3. Exploratory data analysis
+
+```{r eda-tables}
+# Counts and percentages show how common each popularity group is.
+class_summary <- dat |> count(performance_bucket_label) |>
+  mutate(Percent = round(100 * n / sum(n), 1))
+kable(class_summary, caption = "Popularity categories")
+
+# Summarize continuous variables with an easy-to-read table.
+num_cols <- c("likes", "comments", "shares", "saves", "reach",
+              "impressions", "engagement_rate", "followers_gained",
+              "follower_count", "caption_length", "hashtags_count")
+summary_tbl <- map_dfr(num_cols, function(nm) {
+  x <- dat[[nm]]
+  tibble(Variable = nm, Mean = round(mean(x), 2),
+         Median = round(median(x), 2), SD = round(sd(x), 2),
+         Minimum = min(x), Maximum = max(x))
+})
+kable(summary_tbl, caption = "Numeric summary")
+```
+
+```{r eda-plots, fig.width=8, fig.height=4}
+# Bar chart: popularity class distribution.
+ggplot(dat, aes(x = performance_bucket_label,
+                fill = performance_bucket_label)) +
+  geom_bar() + labs(title = "Number of posts at each popularity level",
+                    x = "Popularity", y = "Posts") +
+  theme_minimal() + theme(legend.position = "none")
+
+# Boxplot: how engagement rate changes across the four labels.
+ggplot(dat, aes(x = performance_bucket_label, y = engagement_rate)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(title = "Engagement rate by popularity level",
+       x = "Popularity", y = "Engagement rate") + theme_minimal()
+
+# Display count-target distribution; large values can be skewed.
+ggplot(dat, aes(x = .data[[count_target]])) +
+  geom_histogram(bins = 35, fill = "steelblue", color = "white") +
+  labs(title = paste("Distribution of", count_target),
+       x = count_target, y = "Posts") + theme_minimal()
+```
+
+```{r eda-insights, results='asis'}
+cat(sprintf("\nThe dataset contains **%s cleaned posts**. ", comma(nrow(dat))))
+cat(sprintf("The viral group contains **%s posts (%.1f%%)**. ",
+            sum(dat$viral_binary == "viral"),
+            100 * mean(dat$viral_binary == "viral")))
+cat(sprintf("The average follower count is **%.1f**, and the average new followers gained is **%.1f**. ",
+            mean(dat$follower_count), mean(dat$followers_gained)))
+cat("These are different measurements and should not be treated as interchangeable.\n")
+```
+
+# 4. Training and test data
+
+I reserve 20% of posts for testing and use the other 80% for model training. The split is stratified by popularity label to keep the four groups represented in both sets. All three models use the same split, making the comparison easier.
+
+```{r train-test}
+# Draw 80% of row indices within each popularity class.
+train_ids <- dat |> mutate(row_id = row_number()) |>
+  group_by(performance_bucket_label) |>
+  slice_sample(prop = 0.8) |> ungroup() |> pull(row_id)
+train <- dat[train_ids, ]
+test <- dat[-train_ids, ]
+
+# Only pre/post-time-safe predictors. Factors are coded automatically by R.
+features <- c("account_type", "media_type", "content_category",
+              "traffic_source", "has_call_to_action", "post_hour",
+              "day_of_week", "caption_length", "hashtags_count")
+predictor_formula <- paste(features, collapse = " + ")
+cat("Training rows:", nrow(train), "; Test rows:", nrow(test), "\n")
+```
+
+# 5. Part A: Binary classification (viral or not)
+
+**Method:** Logistic regression predicts the chance that a post is viral. It is appropriate because the response has two values. The classification threshold is 0.5. I compare accuracy with a majority-class baseline and also report precision, recall, and F1 for viral posts, since accuracy alone can be misleading.
+
+```{r binary-fit}
+# Fit a binomial logistic regression using the training rows.
+binary_formula <- as.formula(paste("I(viral_binary == 'viral') ~", predictor_formula))
+binary_model <- glm(binary_formula, data = train, family = binomial())
+summary(binary_model)
+
+# Turn probabilities into predicted class labels.
+binary_prob <- predict(binary_model, newdata = test, type = "response")
+binary_pred <- ifelse(binary_prob >= 0.5, "viral", "not_viral")
+binary_truth <- as.character(test$viral_binary)
+binary_cm <- table(Actual = factor(binary_truth, levels = c("not_viral", "viral")),
+                   Predicted = factor(binary_pred, levels = c("not_viral", "viral")))
+kable(as.data.frame.matrix(binary_cm), caption = "Binary test confusion matrix")
+
+# Compute metrics while guarding against zero denominators.
+safe_div <- function(a, b) ifelse(b == 0, NA_real_, a / b)
+tp <- sum(binary_truth == "viral" & binary_pred == "viral")
+fp <- sum(binary_truth != "viral" & binary_pred == "viral")
+fn <- sum(binary_truth == "viral" & binary_pred != "viral")
+precision <- safe_div(tp, tp + fp)
+recall <- safe_div(tp, tp + fn)
+f1 <- safe_div(2 * precision * recall, precision + recall)
+binary_accuracy <- mean(binary_pred == binary_truth)
+baseline_binary <- max(prop.table(table(train$viral_binary)))
+binary_metrics <- tibble(Metric = c("Accuracy", "Baseline accuracy", "Viral precision", "Viral recall", "Viral F1"),
+                         Score = round(c(binary_accuracy, baseline_binary, precision, recall, f1), 3))
+kable(binary_metrics, caption = "Binary model evaluation (test data)")
+```
+
+```{r binary-interpret, results='asis'}
+cat(sprintf("\nOn unseen posts, logistic regression correctly classifies **%.1f%%** of posts, versus **%.1f%%** for always choosing the most common training class. ",
+            100 * binary_accuracy, 100 * baseline_binary))
+if (is.na(recall)) {
+  cat("Viral recall cannot be calculated. ")
+} else {
+  cat(sprintf("It identifies **%.1f%%** of the truly viral posts. ", 100 * recall))
+}
+cat("A low viral recall means the model misses many viral posts. Because this model uses only information known before posting, it may be hard to predict a post's eventual popularity.\n")
+```
+
+# 6. Part B: Multi-category classification
+
+**Method:** Multinomial logistic regression predicts the four popularity categories: low, medium, high, and viral. It is suitable for a response with more than two categories. I report accuracy, per-class recall, and a confusion matrix.
+
+```{r multiclass-fit}
+# nnet::multinom fits one model with four possible outcomes.
+multi_formula <- as.formula(paste("performance_bucket_label ~", predictor_formula))
+multi_model <- nnet::multinom(multi_formula, data = train, trace = FALSE, maxit = 500)
+multi_pred <- predict(multi_model, newdata = test, type = "class")
+multi_cm <- table(Actual = test$performance_bucket_label,
+                  Predicted = multi_pred)
+kable(as.data.frame.matrix(multi_cm), caption = "Four-category test confusion matrix")
+
+multi_accuracy <- mean(multi_pred == test$performance_bucket_label)
+baseline_multi <- max(prop.table(table(train$performance_bucket_label)))
+class_recall <- diag(multi_cm) / rowSums(multi_cm)
+class_metrics <- data.frame(Category = names(class_recall),
+                            Recall = round(as.numeric(class_recall), 3))
+kable(class_metrics, caption = "Recall for each popularity level")
+kable(tibble(Metric = c("Test accuracy", "Majority-class baseline", "Macro-average recall"),
+             Score = round(c(multi_accuracy, baseline_multi, mean(class_recall)), 3)),
+      caption = "Multiclass overall performance")
+```
+
+```{r multiclass-interpret, results='asis'}
+cat(sprintf("\nThe four-class model has **%.1f%% test accuracy**, compared with **%.1f%%** for always predicting the most common class. ",
+            100 * multi_accuracy, 100 * baseline_multi))
+cat(sprintf("Its average recall across the four classes is **%.1f%%**. ",
+            100 * mean(class_recall)))
+cat("The confusion matrix helps show which popularity levels are being mixed up. If predictions are spread across the wrong groups, posting information alone may not provide enough predictive signal.\n")
+```
+
+# 7. Part C: Count modeling
+
+**Method:** Poisson regression is a starting point for nonnegative count data. I check overdispersion (variance greater than the mean). When overdispersion exists, I also use negative binomial regression, which allows extra count variation. I evaluate prediction using mean absolute error (MAE) and root mean squared error (RMSE): smaller is better.
+
+```{r count-fit}
+# The documentation calls for follower_count. Switch the target at the top
+# only if your instructor approves predicting followers_gained instead.
+count_formula <- as.formula(paste(count_target, "~", predictor_formula))
+
+# Fit Poisson model and calculate overdispersion on training data.
+poisson_model <- glm(count_formula, data = train, family = poisson(link = "log"))
+dispersion <- sum(residuals(poisson_model, type = "pearson")^2) /
+  poisson_model$df.residual
+cat("Count target:", count_target, "\n")
+cat("Target mean:", mean(train[[count_target]]), "\n")
+cat("Target variance:", var(train[[count_target]]), "\n")
+cat("Poisson Pearson dispersion:", round(dispersion, 2), "\n")
+
+# Fit negative binomial model to account for overdispersion.
+nb_model <- MASS::glm.nb(count_formula, data = train,
+                         control = glm.control(maxit = 100))
+summary(nb_model)
+
+# Compare both models against a simple training-mean baseline.
+actual <- test[[count_target]]
+pred_pois <- predict(poisson_model, newdata = test, type = "response")
+pred_nb <- predict(nb_model, newdata = test, type = "response")
+pred_base <- rep(mean(train[[count_target]]), nrow(test))
+mae <- function(y, p) mean(abs(y - p))
+rmse <- function(y, p) sqrt(mean((y - p)^2))
+count_metrics <- tibble(Model = c("Training-mean baseline", "Poisson regression", "Negative binomial regression"),
+                        MAE = round(c(mae(actual, pred_base), mae(actual, pred_pois),
+                                      mae(actual, pred_nb)), 2),
+                        RMSE = round(c(rmse(actual, pred_base), rmse(actual, pred_pois),
+                                       rmse(actual, pred_nb)), 2))
+kable(count_metrics, caption = "Count prediction error on unseen test posts")
+```
+
+```{r count-chart, fig.width=7, fig.height=4}
+# Compare observed and predicted values using the negative binomial model.
+ggplot(tibble(Actual = actual, Predicted = pred_nb),
+       aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = .25, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = "Negative binomial: actual versus predicted counts") +
+  theme_minimal()
+```
+
+```{r count-interpret, results='asis'}
+cat(sprintf("\nThe ratio of Pearson chi-square to residual degrees of freedom is **%.2f**. ", dispersion))
+if (dispersion > 1.5) {
+  cat("This suggests overdispersion, so the negative binomial model is worth considering.")
+} else {
+  cat("This does not show strong overdispersion by a rough 1.5 threshold.")
+}
+best_name <- count_metrics$Model[which.min(count_metrics$MAE)]
+cat(sprintf("By test MAE, the best of these three approaches is **%s**. ", best_name))
+cat("An error reduction compared with the baseline is evidence that the predictors help. This is prediction, not proof that a variable causes follower growth.\n")
+```
+
+# 8. Conclusion
+
+The binary model answers whether a post becomes viral; the multiclass model predicts one of four popularity levels; and the count model predicts account follower count, following the documentation's named response variable. Each model uses a held-out test set, and performance is compared with a simple baseline. It is important to look beyond accuracy and to consider whether each model performs better than guessing the most common result.
+
+The most important limitation is that post popularity is observed after publishing, while many useful engagement features also occur after publishing. Including them would inflate model performance without representing a genuine pre-post prediction. A second limitation is that `follower_count` describes existing account size, whereas `followers_gained` measures the new followers that the written task mentions. That difference should be confirmed with the instructor before using the count model for an actual business decision.
+
