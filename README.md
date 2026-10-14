@@ -20,11 +20,14 @@ imputation technique to replace missing values.
 • [Part-A] Binary classification problem: predict which Instagram posts will become
 viral. For this derive a binary response variable from performance_bucket_label
 column.
+
 • [Part-B] Multi-category classification problem: predict different popularity levels
 for Instagram posts. For this use performance_bucket_label column as response
 variable.
+
 • [Part-C] Count modeling problem: predict number of new followers gained by users
 after sharing a new post on Instagram. For this use follower_count as response
 variable.
-Dataset Source: This dataset was created from an original raw dataset from Kaggle.com for
+
+* Dataset Source: This dataset was created from an original raw dataset from Kaggle.com for
 the purpose of ALY3015 course assignment.
