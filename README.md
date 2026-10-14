@@ -1,4 +1,4 @@
-The dataset documentation lists three types of prediction modeling problem: Binary Classification, Multi-category Classification, and Count Modeling. Develop these three prediction models for the Instagram dataset. 
+The dataset documentation lists three types of prediction modeling problem: Binary Classification, Multi-category Classification, and Count Modeling.
 
 
 # Instagram Analytics Dataset
